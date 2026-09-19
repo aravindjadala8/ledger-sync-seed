@@ -1,5 +1,6 @@
 package in.simplifymoney.ledgersync.store;
 
+import in.simplifymoney.ledgersync.store.DynamoDbDocumentStore;
 import in.simplifymoney.ledgersync.identity.TransactionIdentity;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
 import java.time.temporal.ChronoUnit;
@@ -7,7 +8,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-
+import java.util.HashMap;
 /**
  * Proves the two stores agree, and says precisely where they do not.
  *
@@ -113,20 +114,26 @@ public final class ConsistencyChecker {
     }
 
     private Map<TransactionIdentity, NormalizedTxn> allDocuments() {
-        Map<TransactionIdentity, NormalizedTxn> out = new LinkedHashMap<>();
-        if (documents instanceof InMemoryDocumentStore mem) {
-            for (NormalizedTxn t : mem.all()) out.put(TransactionIdentity.of(t), t);
-            return out;
+    Map<TransactionIdentity, NormalizedTxn> out = new HashMap<>();
+
+    if (documents instanceof InMemoryDocumentStore mem) {
+        for (NormalizedTxn t : mem.all()) {
+            out.put(TransactionIdentity.of(t), t);
         }
-        // A real DynamoDB/Mongo implementation would need its own bulk scan
-        // for this maintenance operation (this is the one place scanning
-        // the whole store is legitimate: proving global consistency
-        // necessarily requires seeing every item at least once, on both
-        // sides). InMemoryDocumentStore exposes all() for exactly this.
-        throw new UnsupportedOperationException(
-                "ConsistencyChecker needs a way to enumerate every document; "
-                        + "add that to whichever DocumentStore implementation is in use");
+        return out;
     }
+
+    if (documents instanceof DynamoDbDocumentStore dynamo) {
+        for (NormalizedTxn t : dynamo.all()) {
+            out.put(TransactionIdentity.of(t), t);
+        }
+        return out;
+    }
+
+    throw new UnsupportedOperationException(
+            "ConsistencyChecker needs a way to enumerate every document; "
+                    + "add that to whichever DocumentStore implementation is in use");
+}
 
     private static String describe(NormalizedTxn t) {
         return t.accountLast4() + " " + t.direction() + " " + t.amount().toPlainString()
