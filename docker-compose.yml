@@ -1,0 +1,65 @@
+# One command to bring the whole pipeline up:
+#   docker compose up --build migrate ingest report
+#
+# See the Dockerfile's top comment: this was written but not build/run
+# in the sandbox this project was implemented in (no Docker daemon, no
+# network to Maven Central there). Please verify it in an environment with
+# both before relying on it.
+#
+# The document-store design targets DynamoDB (see DocumentStore.java's
+# javadoc for the full PK/SK/GSI spec). "dynamodb-local" below runs a real
+# local DynamoDB for that purpose; ledger-sync's own backfill/
+# consistency-check commands currently talk to InMemoryDocumentStore (an
+# in-memory stand-in with the identical index shape - see the README's
+# "document store" section for exactly why), so wiring a DynamoDbDocumentStore
+# implementation against this container is the concrete next step, not yet
+# done - the service is included so that step has something to run against.
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8000:8000"
+
+  migrate:
+    build: .
+    command: ["migrate"]
+    volumes:
+      - ledger-data:/app/data
+
+  ingest:
+    build: .
+    command: ["ingest", "fixtures/corpus-a.jsonl"]
+    volumes:
+      - ledger-data:/app/data
+    depends_on:
+      - migrate
+
+  report:
+    build: .
+    command: ["report", "submission"]
+    volumes:
+      - ledger-data:/app/data
+      - ./submission:/app/submission
+    depends_on:
+      - ingest
+
+  backfill:
+    build: .
+    command: ["backfill"]
+    volumes:
+      - ledger-data:/app/data
+    depends_on:
+      - dynamodb-local
+      - ingest
+
+  consistency-check:
+    build: .
+    command: ["consistency-check"]
+    volumes:
+      - ledger-data:/app/data
+    depends_on:
+      - backfill
+
+volumes:
+  ledger-data:

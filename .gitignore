@@ -4,6 +4,8 @@ out/
 *.class
 data/*.mv.db
 data/*.trace.db
+data/document-store.json
+data/balance-evidence.json
 submission/
 .idea/
 *.iml
