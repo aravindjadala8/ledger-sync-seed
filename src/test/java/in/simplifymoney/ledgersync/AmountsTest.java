@@ -45,4 +45,17 @@ class AmountsTest {
     void ignoresAMessageWithNoAmountAtAll() {
         assertEquals(null, Amounts.first("Your Swiggy order is on the way!"));
     }
+
+    /**
+     * INC-2026-09-11 regression, at the Amounts level: a whole-rupee amount
+     * (no paise) used to fail to match at all, so first() would skip past it
+     * to the next rupee figure in the string - the balance. This must now
+     * match the amount itself.
+     */
+    @Test
+    void readsWholeRupeeAmountsWithNoPaise() {
+        assertEquals(new BigDecimal("5.00"),
+                Amounts.first("Rs.5 debited from a/c **4821 on 27-06-26 at 10:00 to "
+                        + "UPI/WATER CAN. Avl Bal: Rs.92,213.10."));
+    }
 }
