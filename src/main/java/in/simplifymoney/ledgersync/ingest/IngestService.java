@@ -1,8 +1,9 @@
 package in.simplifymoney.ledgersync.ingest;
 
+import in.simplifymoney.ledgersync.identity.Categorizer;
+import in.simplifymoney.ledgersync.identity.Deduplicator;
+import in.simplifymoney.ledgersync.identity.TxnGroup;
 import in.simplifymoney.ledgersync.json.Json;
-import in.simplifymoney.ledgersync.model.Category;
-import in.simplifymoney.ledgersync.model.Direction;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
 import in.simplifymoney.ledgersync.model.RawMessage;
 import in.simplifymoney.ledgersync.parse.ParsedTxn;
@@ -19,16 +20,33 @@ import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
- * Reads a corpus of raw messages and puts transactions in the ledger.
+ * Reads a corpus of raw messages and puts real transactions in the ledger.
  *
- * This is the naive version. It parses each message on its own and saves
- * whatever comes back. It does not ask whether two messages describe the same
- * transaction, and it decides the category from the direction alone.
+ * Pipeline, per file ingested:
+ *   1. parse every message (a message that is not a transaction - OTP,
+ *      balance enquiry, promo, phishing, future-dated e-mandate, noise -
+ *      correctly parses to nothing and is skipped, not an error)
+ *   2. Deduplicator groups the parsed evidence into real transactions,
+ *      collapsing re-upload replays, same-channel duplicates and
+ *      cross-channel (SMS/email) duplicates by content identity
+ *   3. Categorizer assigns exactly one Category per transaction (TRANSFER,
+ *      then MICRO, then SPEND/INCOME)
+ *   4. each resulting transaction is upserted into the store
+ *
+ * Idempotency: step 4 uses LedgerStore.upsert, which merges into an existing
+ * row of the same content identity rather than inserting a duplicate. This
+ * is what makes it safe to ingest the same corpus twice, ingest overlapping
+ * corpora, or retry after a partial failure - the ledger converges to the
+ * same state regardless of how many times or in what order the same
+ * evidence is (re-)ingested.
  */
 public final class IngestService {
 
     private final Parsers parsers;
     private final LedgerStore store;
+    private final Deduplicator deduplicator = new Deduplicator();
+    private final Categorizer categorizer = new Categorizer();
+    private Map<String, java.math.BigDecimal> lastBalanceEvidence = Map.of();
 
     public IngestService(Parsers parsers, LedgerStore store) {
         this.parsers = parsers;
@@ -37,7 +55,11 @@ public final class IngestService {
 
     public Stats ingestFile(Path corpus) throws IOException {
         List<RawMessage> messages = readCorpus(corpus);
-        int parsed = 0;
+        return ingest(messages);
+    }
+
+    public Stats ingest(List<RawMessage> messages) {
+        List<Deduplicator.Evidence> evidence = new ArrayList<>();
         int skipped = 0;
         for (RawMessage m : messages) {
             Optional<ParsedTxn> p = parsers.parse(m);
@@ -45,10 +67,37 @@ public final class IngestService {
                 skipped++;
                 continue;
             }
-            store.save(toTransaction(p.get()));
-            parsed++;
+            evidence.add(new Deduplicator.Evidence(p.get(), !"email".equals(m.channel())));
         }
-        return new Stats(messages.size(), parsed, skipped);
+
+        List<TxnGroup> groups = deduplicator.dedupe(evidence);
+        categorizer.categorize(groups);
+
+        Map<String, java.math.BigDecimal> balanceEvidence = new java.util.LinkedHashMap<>();
+        for (TxnGroup g : groups) {
+            NormalizedTxn txn = g.toNormalizedTxn();
+            store.upsert(txn);
+            if (g.statedBalance() != null) {
+                balanceEvidence.put(txn.sourceMessageIds().get(0), g.statedBalance());
+            }
+        }
+        this.lastBalanceEvidence = balanceEvidence;
+
+        return new Stats(messages.size(), groups.size(), skipped);
+    }
+
+    /**
+     * The balance the bank quoted alongside each transaction produced by the
+     * most recent call to ingest()/ingestFile(), keyed by that transaction's
+     * first (lexicographically smallest) source_message_id - a stable,
+     * deterministic key derivable again later from a NormalizedTxn already
+     * in the store. Used only by reconciliation (see Reports.reconciliation)
+     * to localize a balance-chain discrepancy to a specific transaction;
+     * never persisted as part of the frozen NormalizedTxn/LedgerStore
+     * contract.
+     */
+    public Map<String, java.math.BigDecimal> lastBalanceEvidence() {
+        return lastBalanceEvidence;
     }
 
     public static List<RawMessage> readCorpus(Path corpus) throws IOException {
@@ -68,11 +117,19 @@ public final class IngestService {
         return out;
     }
 
-    private NormalizedTxn toTransaction(ParsedTxn p) {
-        Category c = p.direction() == Direction.DEBIT ? Category.SPEND : Category.INCOME;
-        return new NormalizedTxn(p.accountLast4(), p.occurredAt(), p.direction(),
-                p.amount(), c, p.merchant(), List.of(p.sourceMessageId()));
+    /**
+     * messagesRead: every raw message seen this call.
+     * transactionsWritten: the number of DISTINCT real transactions this
+     *   batch resolved to (after dedup) - NOT the number of store writes,
+     *   since some of those "writes" are merges into a row that already
+     *   existed from a previous ingest.
+     * messagesSkipped: messages that parsed to no transaction (noise).
+     */
+    public record Stats(int messagesRead, int transactionsWritten, int messagesSkipped) {
+        @Override
+        public String toString() {
+            return "messages read=" + messagesRead + " transactions=" + transactionsWritten
+                    + " skipped=" + messagesSkipped;
+        }
     }
-
-    public record Stats(int messagesRead, int transactionsWritten, int messagesSkipped) {}
 }

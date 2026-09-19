@@ -1,5 +1,6 @@
 package in.simplifymoney.ledgersync.store;
 
+import in.simplifymoney.ledgersync.identity.TransactionIdentity;
 import in.simplifymoney.ledgersync.model.Category;
 import in.simplifymoney.ledgersync.model.Direction;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
@@ -16,6 +17,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.TreeSet;
 
 /**
  * The store this service has used since it was written: a single relational
@@ -93,6 +95,52 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
         } catch (SQLException e) {
             throw new IllegalStateException("could not save " + t, e);
         }
+    }
+
+    /**
+     * Insert, or merge into an existing row with the same content identity
+     * (see TransactionIdentity). Candidate rows are narrowed down in SQL by
+     * the indexed, cheaply-comparable columns (account, direction, amount,
+     * merchant); the final identity check (which also compares the
+     * minute-truncated occurred_at) happens in Java against that small
+     * candidate set, never against the whole table.
+     */
+    @Override
+    public synchronized void upsert(NormalizedTxn txn) {
+        TransactionIdentity incoming = TransactionIdentity.of(txn);
+        try (PreparedStatement q = conn.prepareStatement(
+                "SELECT id, occurred_at, source_message_ids FROM ledger"
+                        + " WHERE account_last4 = ? AND direction = ? AND amount = ?"
+                        + " AND merchant = ?")) {
+            q.setString(1, txn.accountLast4());
+            q.setString(2, txn.direction().name());
+            q.setBigDecimal(3, txn.amount());
+            q.setString(4, txn.merchant());
+            try (ResultSet rs = q.executeQuery()) {
+                while (rs.next()) {
+                    OffsetDateTime existingAt = OffsetDateTime.parse(rs.getString(2));
+                    TransactionIdentity existingId = TransactionIdentity.of(
+                            txn.accountLast4(), txn.direction(), txn.amount(),
+                            txn.merchant(), existingAt);
+                    if (!existingId.equals(incoming)) continue;
+
+                    long id = rs.getLong(1);
+                    TreeSet<String> merged = new TreeSet<>(Arrays.stream(
+                            rs.getString(3).split(",")).filter(s -> !s.isBlank()).toList());
+                    merged.addAll(txn.sourceMessageIds());
+                    try (PreparedStatement u = conn.prepareStatement(
+                            "UPDATE ledger SET source_message_ids = ? WHERE id = ?")) {
+                        u.setString(1, String.join(",", merged));
+                        u.setLong(2, id);
+                        u.executeUpdate();
+                    }
+                    return;
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not upsert " + txn, e);
+        }
+        save(txn);
     }
 
     @Override
